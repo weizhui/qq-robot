@@ -14,7 +14,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from reply_interface import build_ai_answer, build_anime_recommendation, build_reply
+from reply_interface import (
+    build_ai_answer,
+    build_anime_recommendation,
+    build_reply,
+    build_story_chain_result,
+    expire_story_game,
+)
 
 
 BOT_QQ = str(os.getenv("BOT_QQ", "")).strip()
@@ -32,8 +38,9 @@ NAPCAT_API_BASE = os.getenv("NAPCAT_API_BASE", "").rstrip("/")
 NAPCAT_ACCESS_TOKEN = os.getenv("NAPCAT_ACCESS_TOKEN", "")
 DISCLAIMER = "本项目仅供娱乐，不进行任何商业用处，如有侵权，请联系维护者进行删除。"
 DISCLAIMER_REPLY_MARKERS = (
-    "【星云·赛博帮助手册】",
-    "【今日星云】",
+    "【星芒·碰爪】",
+    "【星芒·赛博帮助手册】",
+    "【今日星芒】",
     "【今日星图】",
     "【今日壁纸】",
     "【今日海报】",
@@ -43,16 +50,43 @@ CUTE_LINE_EMOJIS = ("✨", "🛸", "💫", "🥤", "🌟", "📡", "🌙")
 EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF]")
 
 
+# 只在 0、6、12、18 点报时，其余整点保持安静。
+TIME_CHIME_HOURS = (0, 6, 12, 18)
+
 TIME_CHIME_LINES = (
-    "整点信标已点亮，星云触角准时敲钟。",
+    "整点信标已点亮，星芒触角准时敲钟。",
     "全息电子眼扫过表盘：时间没有偷懒。",
     "能量汽水冒了一个泡，提示大家换个姿势继续前进。",
     "深空频道发来整点回声，收到请眨眨眼。",
-    "星云把时间拎出来抖了抖：又是新的一小时。",
+    "星芒把时间拎出来抖了抖：又是新的一小时。",
     "赛博小闹钟完成跃迁，准点抵达当前小时。",
     "宇宙钟摆轻轻一晃，整点到站。",
     "触角校时成功，大家的时间线仍然稳定。",
 )
+
+# 每个报时点附带对应的事件提醒。
+TIME_CHIME_EVENTS = {
+    0: (
+        "🌙【星芒晚安提醒】",
+        "零点到站，该睡觉啦。把手机放远一点、关灯钻进被窝，"
+        "明天的时间线还需要你满电上线。晚安 💫",
+    ),
+    6: (
+        "🌅【星芒早安提醒】",
+        "六点晨光抵达，该起床啦。伸个懒腰、喝口温水，"
+        "把困意留在枕头里，新的一天正式开始。早安 🌟",
+    ),
+    12: (
+        "🍚【星芒午间提醒】",
+        "正午能量告急，该吃午饭啦。好好吃饭，饭后小憩一会儿，"
+        "下午才有力气继续折腾。别忘了喝水 🥤",
+    ),
+    18: (
+        "🌆【星芒收工提醒】",
+        "十八点收工钟响，该下班啦。放下手头的事，"
+        "去吃顿晚饭、散散步，把耗掉的电量慢慢补回来 🛸",
+    ),
+}
 
 
 logging.basicConfig(
@@ -106,6 +140,11 @@ def normalize_user_message(event):
     return " ".join(part.strip() for part in parts if part).strip()
 
 
+# 本机调用不走任何代理：环境里可能存在 clash 之类的 http_proxy，
+# 否则发往 127.0.0.1 的请求会被代理转发并失败（表现为 HTTP 502）。
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def call_napcat(action, payload):
     url = f"{NAPCAT_API_BASE}/{action}"
     body = json.dumps(payload).encode("utf-8")
@@ -115,7 +154,7 @@ def call_napcat(action, payload):
 
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with _LOCAL_OPENER.open(request, timeout=10) as response:
             response_body = response.read().decode("utf-8", errors="replace")
             if response_body:
                 logger.debug("NapCat response: %s", response_body)
@@ -185,39 +224,55 @@ def next_beijing_8am(now=None):
     return target
 
 
-def next_beijing_hour(now=None):
+def next_beijing_chime(now=None):
+    """返回下一个报时时刻（北京时间 0、6、12、18 点）。"""
     now = now or datetime.now(BEIJING_TZ)
-    target = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-    return target
+    for hour in TIME_CHIME_HOURS:
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if target > now:
+            return target
+    return (now + timedelta(days=1)).replace(
+        hour=TIME_CHIME_HOURS[0], minute=0, second=0, microsecond=0
+    )
 
 
 def build_time_chime(now=None):
     now = now or datetime.now(BEIJING_TZ)
     line = TIME_CHIME_LINES[now.hour % len(TIME_CHIME_LINES)]
-    return f"""🕘【星云整点报时】
+    event_title, event_text = TIME_CHIME_EVENTS[now.hour]
+    return f"""🕘【星芒整点报时】
 北京时间 {now:%Y-%m-%d %H:00}
 
-{line} 🛸✨"""
+{line} 🛸✨
+
+{event_title}
+{event_text}"""
 
 
-def hourly_time_chime_worker():
+def time_chime_worker():
     while True:
-        target = next_beijing_hour()
-        sleep_seconds = max(1, (target - datetime.now(BEIJING_TZ)).total_seconds())
-        logger.info("Next hourly time chime at %s", target.isoformat())
-        time.sleep(sleep_seconds)
+        target = next_beijing_chime()
+        logger.info("Next time chime at %s", target.isoformat())
+        while True:
+            sleep_seconds = (target - datetime.now(BEIJING_TZ)).total_seconds()
+            if sleep_seconds <= 0:
+                break
+            time.sleep(sleep_seconds)
 
         now = datetime.now(BEIJING_TZ)
+        if now.hour not in TIME_CHIME_HOURS:
+            # 时钟被调整等异常情况下不误报，重新等下一个报时点。
+            continue
         message = build_time_chime(now)
         for group_id in sorted(TARGET_GROUP_IDS):
             try:
                 send_group_reply(group_id, message)
             except Exception:
-                logger.exception("Failed to send hourly time chime group=%s", group_id)
+                logger.exception("Failed to send time chime group=%s", group_id)
 
 
-def start_hourly_time_chime_worker():
-    thread = threading.Thread(target=hourly_time_chime_worker, name="hourly-time-chime-worker", daemon=True)
+def start_time_chime_worker():
+    thread = threading.Thread(target=time_chime_worker, name="time-chime-worker", daemon=True)
     thread.start()
 
 
@@ -250,6 +305,31 @@ def start_anime_daily_push_worker():
     thread.start()
 
 
+def story_chain_timeout_worker():
+    """每 5 分钟检查一次：接龙局超过 2 小时无人操作就自动结算。"""
+    while True:
+        time.sleep(300)
+        try:
+            expired = expire_story_game()
+        except Exception:
+            logger.exception("Story chain timeout check failed")
+            continue
+        if not expired:
+            continue
+        group_id, message = expired
+        try:
+            send_group_reply(int(group_id), message)
+            logger.info("Story chain auto settled group=%s", group_id)
+        except Exception:
+            logger.exception("Failed to send story chain timeout notice group=%s", group_id)
+
+
+def start_story_chain_timeout_worker():
+    thread = threading.Thread(target=story_chain_timeout_worker,
+                              name="story-chain-timeout-worker", daemon=True)
+    thread.start()
+
+
 def handle_event(event):
     if event.get("post_type") != "message":
         return
@@ -276,10 +356,22 @@ def handle_event(event):
         group_id=event_group_id,
     )
     if isinstance(reply, dict) and reply.get("type") == "deepseek_question":
-        send_group_reply(event_group_id, reply["immediate"])
+        if reply.get("immediate"):
+            send_group_reply(event_group_id, reply["immediate"])
         thread = threading.Thread(
             target=send_ai_answer,
             args=(event_group_id, reply["question"]),
+            # 带上提问者身份，后台线程才能取到他的长期记忆
+            kwargs={"user_id": reply.get("user_id")},
+            daemon=True,
+        )
+        thread.start()
+        return
+    if isinstance(reply, dict) and reply.get("type") == "story_chain":
+        send_group_reply(event_group_id, reply["immediate"])
+        thread = threading.Thread(
+            target=send_story_chain_reply,
+            args=(event_group_id, reply["user_id"], reply["story"]),
             daemon=True,
         )
         thread.start()
@@ -287,11 +379,24 @@ def handle_event(event):
     send_group_reply(event_group_id, reply)
 
 
-def send_ai_answer(group_id, question):
-    logger.info("DeepSeek question started group=%s question=%r", group_id, question[:120])
-    answer = build_ai_answer(question)
+def send_ai_answer(group_id, question, user_id=None):
+    logger.info("DeepSeek question started group=%s user=%s question=%r",
+                group_id, user_id, question[:120])
+    answer = build_ai_answer(question, user_id=user_id, group_id=group_id)
     send_group_reply(group_id, answer)
     logger.info("DeepSeek question finished group=%s", group_id)
+
+
+def send_story_chain_reply(group_id, user_id, story_text):
+    """后台线程：调用 DeepSeek 评分后把结果发回群里。"""
+    logger.info("Story chain scoring started group=%s user=%s", group_id, user_id)
+    try:
+        message = build_story_chain_result(group_id, user_id, story_text)
+    except Exception:
+        logger.exception("Story chain scoring failed group=%s user=%s", group_id, user_id)
+        message = "😵【星芒走神了】这次的故事没能评上分，再发一次试试吧 ✨"
+    send_group_reply(group_id, message)
+    logger.info("Story chain scoring finished group=%s user=%s", group_id, user_id)
 
 
 class OneBotWebhookHandler(BaseHTTPRequestHandler):
@@ -372,7 +477,8 @@ def main():
     logger.info("Webhook path: /onebot host=%s port=%s", HOST, PORT)
     logger.info("NapCat API: %s", NAPCAT_API_BASE)
     start_anime_daily_push_worker()
-    start_hourly_time_chime_worker()
+    start_time_chime_worker()
+    start_story_chain_timeout_worker()
 
     try:
         server = ThreadingHTTPServer((HOST, PORT), OneBotWebhookHandler)
