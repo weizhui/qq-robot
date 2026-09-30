@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import logging
 import os
+import random
 import re
 import sys
 import threading
@@ -14,12 +16,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import xingmang_voice
 from reply_interface import (
     build_ai_answer,
     build_anime_recommendation,
     build_reply,
     build_story_chain_result,
+    daily_visual,
+    ensure_daily_state,
     expire_story_game,
+    today_nebula,
 )
 
 
@@ -34,19 +40,29 @@ PORT = int(os.getenv("PORT", "8080"))
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 BASE_DIR = Path(__file__).resolve().parent
 ANIME_PUSH_STATE_PATH = BASE_DIR / "runtime_cache" / "anime_push_state.json"
+SCHEDULED_CONTENT_STATE_PATH = BASE_DIR / "runtime_cache" / "scheduled_content_state.json"
+PROACTIVE_STATE_PATH = BASE_DIR / "runtime_cache" / "proactive_reply_state.json"
+EXPRESSION_PACK_PATH = BASE_DIR / "runtime_cache" / "expression_pack.json"
 NAPCAT_API_BASE = os.getenv("NAPCAT_API_BASE", "").rstrip("/")
 NAPCAT_ACCESS_TOKEN = os.getenv("NAPCAT_ACCESS_TOKEN", "")
-DISCLAIMER = "本项目仅供娱乐，不进行任何商业用处，如有侵权，请联系维护者进行删除。"
-DISCLAIMER_REPLY_MARKERS = (
-    "【星芒·碰爪】",
-    "【星芒·赛博帮助手册】",
-    "【今日星芒】",
-    "【今日星图】",
-    "【今日壁纸】",
-    "【今日海报】",
-)
-
-CUTE_LINE_EMOJIS = ("✨", "🛸", "💫", "🥤", "🌟", "📡", "🌙")
+PROACTIVE_REPLY_ENABLED = os.getenv("PROACTIVE_REPLY_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+PROACTIVE_CHECK_SECONDS = int(os.getenv("PROACTIVE_CHECK_SECONDS", "900"))
+PROACTIVE_REPLY_PROBABILITY = float(os.getenv("PROACTIVE_REPLY_PROBABILITY", "0.18"))
+PROACTIVE_REPLY_COOLDOWN_SECONDS = int(os.getenv("PROACTIVE_REPLY_COOLDOWN_SECONDS", "7200"))
+PROACTIVE_CONTEXT_MESSAGES = int(os.getenv("PROACTIVE_CONTEXT_MESSAGES", "5"))
+PROACTIVE_MIN_MESSAGES = int(os.getenv("PROACTIVE_MIN_MESSAGES", "3"))
+PROACTIVE_QUIET_START_HOUR = int(os.getenv("PROACTIVE_QUIET_START_HOUR", "1"))
+PROACTIVE_QUIET_END_HOUR = int(os.getenv("PROACTIVE_QUIET_END_HOUR", "7"))
+EXPRESSION_REFRESH_SECONDS = int(os.getenv("EXPRESSION_REFRESH_SECONDS", str(24 * 60 * 60)))
+EXPRESSION_APPEND_PROBABILITY = float(os.getenv("EXPRESSION_APPEND_PROBABILITY", "0.32"))
+EXPRESSION_SOURCE_URLS = [
+    url.strip() for url in os.getenv(
+        "EXPRESSION_SOURCE_URLS",
+        "https://raw.githubusercontent.com/oclif/kaomoji/master/src/kaomoji.ts,"
+        "https://gist.githubusercontent.com/uuz2333/7d976d46127de3ffd2c7c11365ce39d0/raw/kaomoji.dict.yaml",
+    ).split(",") if url.strip()
+]
+CUTE_LINE_EMOJIS = ("✨", "🛸", "💫", "🥤", "🌟", "📡", "🌙", "₍ᐢ.ˬ.ᐢ₎", "(˶˃ ᵕ ˂˶)", "ฅ՞•ﻌ•՞ฅ")
 EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF]")
 
 
@@ -67,14 +83,12 @@ TIME_CHIME_LINES = (
 # 每个报时点附带对应的事件提醒。
 TIME_CHIME_EVENTS = {
     0: (
-        "🌙【星芒晚安提醒】",
-        "零点到站，该睡觉啦。把手机放远一点、关灯钻进被窝，"
-        "明天的时间线还需要你满电上线。晚安 💫",
+        "🌙【星芒零点提醒】",
+        "零点到站，深空频道切换到低功耗模式。记得照顾好自己的时间线 💫",
     ),
     6: (
-        "🌅【星芒早安提醒】",
-        "六点晨光抵达，该起床啦。伸个懒腰、喝口温水，"
-        "把困意留在枕头里，新的一天正式开始。早安 🌟",
+        "🌅【星芒六点提醒】",
+        "六点晨光抵达，触角完成校时。喝口水，慢慢把电量调回在线状态 🌟",
     ),
     12: (
         "🍚【星芒午间提醒】",
@@ -94,6 +108,132 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("qq-bot")
+
+RECENT_GROUP_MESSAGES = {}
+RECENT_GROUP_LOCK = threading.Lock()
+EXPRESSION_PACK = []
+EXPRESSION_LOCK = threading.Lock()
+
+
+FALLBACK_EXPRESSIONS = (
+    "(˶˃ ᵕ ˂˶)", "₍ᐢ.ˬ.ᐢ₎", "ฅ՞•ﻌ•՞ฅ", "(๑•̀ㅂ•́)و✧", "(｡•̀ᴗ-)✧",
+    "(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧", "(っ˘ω˘ς)", "٩(ˊᗜˋ*)و", "( ´͈ ᵕ `͈ )◞♡", "꒰ঌ(˶˃ ᵕ ˂˶)໒꒱",
+    "✧*｡٩(ˊᗜˋ*)و✧*｡", "╰(*°▽°*)╯", "＼(＾O＾)／", "(づ｡◕‿‿◕｡)づ", "(ღ˘⌣˘ღ)",
+    "(✿◡‿◡)", "(*/ω＼*)", "(。﹏。*)", "(⊙﹏⊙)", "(◕ᴥ◕ʋ)",
+    "=•ω•=", "^._.^", "(=^･ｪ･^=)", "(・3・)", "(☞ﾟ∀ﾟ)☞",
+    "(｡･∀･)ﾉﾞ", "(≧▽≦)", "(๑˃ᴗ˂)ﻭ", "(๑>◡<๑)", "(੭ˊᵕˋ)੭",
+    "(๑•̀ㅁ•́ฅ)", "(ง •̀_•́)ง", "ᕦ(òᴥó)ᕥ", "୧(▲ᴗ▲)ノ", "ヽ༼ຈل͜ຈ༽ﾉ",
+    "╮(╯▽╰)╭", "(￣▽￣)~*", "(‾◡◝)", "(。・_・)/~~~", "(☞ﾟヮﾟ)☞",
+    "(ಡ_ಡ)☞", "(◔_◔)", "ಠ_ಠ", "→_←", "←_←",
+    "(－‸ლ)", "(°ー°〃)", "(⊙＿⊙')", "(´･ω･`)", "(´｡• ᵕ •｡`)",
+    "(๑•́ ₃ •̀๑)", "(๑•́ ₃ •̀๑)੭", "(๑•̀ㅂ•́)و", "(˵ •̀ ᴗ - ˵ ) ✧", "(˶ᵔ ᵕ ᵔ˶)",
+    "(˶ᵔ ᵕ ᵔ˶)ﾉ", "(˶ˊᵕˋ˵)", "(ﾉ´ヮ`)ﾉ*: ･ﾟ", "(｡･ω･｡)ﾉ♡", "(๑´ㅂ`๑)",
+    "(๑˘︶˘๑)", "(˘︶˘).｡.:*♡", "(๑˃̵ᴗ˂̵)و", "(๑╹◡╹)ﾉ", "(๑•̀ㅁ•́ฅ✧",
+    "(ฅ´ω`ฅ)", "ฅ( ̳• ◡ • ̳)ฅ", "ฅ^•ﻌ•^ฅ",
+    "✨", "💫", "🌟", "🛸", "📡", "🪐", "🌙", "🥤", "🤖", "🫧",
+    "⭐", "🌌", "🔭", "🎧", "🎮", "📚", "🎬", "🎴", "🧠", "💭",
+)
+
+
+def load_expression_pack():
+    global EXPRESSION_PACK
+    try:
+        data = json.loads(EXPRESSION_PACK_PATH.read_text(encoding="utf-8"))
+        expressions = data.get("expressions") if isinstance(data, dict) else data
+        if isinstance(expressions, list):
+            with EXPRESSION_LOCK:
+                EXPRESSION_PACK = [str(item) for item in expressions if str(item).strip()]
+    except (OSError, json.JSONDecodeError):
+        with EXPRESSION_LOCK:
+            EXPRESSION_PACK = list(FALLBACK_EXPRESSIONS)
+
+
+def parse_expression_candidates(text):
+    candidates = set()
+    # Only accept complete quoted values from online sources. This avoids source-code
+    # fragments such as "words: [" or partial kaomoji split by whitespace.
+    for match in re.finditer(r'["\']([^"\'\n]{2,36})["\']', text):
+        value = match.group(1).strip()
+        if looks_like_expression(value):
+            candidates.add(value)
+    return candidates
+
+
+def looks_like_expression(value):
+    if not (2 <= len(value) <= 36):
+        return False
+    value = value.strip()
+    banned_fragments = (
+        "http", "function", "const", "Object.", "words", "dead", "pi", "gotit",
+        "bearflip", "return", "export", "import", "=>", "};", "[{", "}]",
+        "true", "false", "undefined",
+    )
+    if any(fragment in value for fragment in banned_fragments):
+        return False
+    if any(ch in value for ch in "{}[];:"):
+        return False
+    if re.search(r"[A-Za-z]{4,}", value):
+        return False
+    if value in {",", "<-", ">>", "♪♬", "\\(", "\\）"}:
+        return False
+    if value.count("(") != value.count(")"):
+        return False
+    if value.count("（") != value.count("）"):
+        return False
+    has_emoji = EMOJI_RE.search(value) is not None
+    face_like = bool(re.search(r"[()（）].*[ω∀Д▽ᴗᵕ˃˂•̀́˘˶｡♡✧ฅﻌᐢﾉง٩وっ◕ヮㅂᵔ╹･].*[()（）]", value))
+    cute_symbols = any(ch in value for ch in "♡☆✧꒰꒱ฅᐢ₍₎ﾉง٩وっღ༼༽╯╰ノヽᕦ୧ԅ☞✌")
+    return has_emoji or (face_like and cute_symbols)
+
+
+def refresh_expression_pack_once():
+    collected = set()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for url in EXPRESSION_SOURCE_URLS:
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "xingmang-expression-refresh"})
+            with opener.open(request, timeout=12) as response:
+                body = response.read().decode("utf-8", errors="replace")
+            collected.update(parse_expression_candidates(body))
+        except Exception:
+            logger.exception("Failed to refresh expression source: %s", url)
+    online = [item for item in sorted(collected) if item not in FALLBACK_EXPRESSIONS]
+    random.shuffle(online)
+    expressions = list(FALLBACK_EXPRESSIONS) + online[:40]
+    EXPRESSION_PACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    EXPRESSION_PACK_PATH.write_text(json.dumps({
+        "updated_at": datetime.now(BEIJING_TZ).isoformat(),
+        "sources": EXPRESSION_SOURCE_URLS,
+        "expressions": expressions,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    with EXPRESSION_LOCK:
+        EXPRESSION_PACK[:] = expressions
+    logger.info("Expression pack refreshed: %s items", len(expressions))
+
+
+def expression_refresh_worker():
+    load_expression_pack()
+    try:
+        refresh_expression_pack_once()
+    except Exception:
+        logger.exception("Initial expression refresh failed")
+    while True:
+        time.sleep(max(3600, EXPRESSION_REFRESH_SECONDS))
+        try:
+            refresh_expression_pack_once()
+        except Exception:
+            logger.exception("Expression refresh failed")
+
+
+def start_expression_refresh_worker():
+    thread = threading.Thread(target=expression_refresh_worker, name="expression-refresh-worker", daemon=True)
+    thread.start()
+
+
+def pick_expression():
+    with EXPRESSION_LOCK:
+        pool = list(EXPRESSION_PACK or FALLBACK_EXPRESSIONS)
+    return random.choice(pool) if pool else random.choice(FALLBACK_EXPRESSIONS)
 
 
 def message_mentions_bot(event):
@@ -167,14 +307,7 @@ def call_napcat(action, payload):
 
 
 def append_disclaimer(message):
-    if not message:
-        return message
-    text = str(message).rstrip()
-    if not any(marker in text for marker in DISCLAIMER_REPLY_MARKERS):
-        return text
-    if DISCLAIMER in text:
-        return text
-    return f"{text}\n\n{DISCLAIMER}"
+    return message
 
 
 def add_cute_emojis(message):
@@ -183,10 +316,17 @@ def add_cute_emojis(message):
     emoji_index = 0
     for line in lines:
         stripped = line.strip()
-        if not stripped or stripped.startswith("[CQ:") or EMOJI_RE.search(line):
+        if not stripped or stripped.startswith("[CQ:"):
             enriched.append(line)
             continue
-        enriched.append(f"{line} {CUTE_LINE_EMOJIS[emoji_index % len(CUTE_LINE_EMOJIS)]}")
+        if EMOJI_RE.search(line) and random.random() > EXPRESSION_APPEND_PROBABILITY:
+            enriched.append(line)
+            continue
+        if random.random() < EXPRESSION_APPEND_PROBABILITY:
+            suffix = pick_expression()
+        else:
+            suffix = CUTE_LINE_EMOJIS[emoji_index % len(CUTE_LINE_EMOJIS)]
+        enriched.append(f"{line} {suffix}")
         emoji_index += 1
     return "\n".join(enriched).rstrip()
 
@@ -194,14 +334,77 @@ def add_cute_emojis(message):
 def send_group_reply(group_id, message):
     if not message:
         return
-    message = add_cute_emojis(append_disclaimer(message))
+    text_message = add_cute_emojis(append_disclaimer(message))
+
+    wants_voice = xingmang_voice.should_reply_with_voice()
+
+    if wants_voice and xingmang_voice.async_enabled():
+        call_napcat(
+            "send_group_msg",
+            {
+                "group_id": int(group_id),
+                "message": text_message,
+            },
+        )
+        thread = threading.Thread(
+            target=send_group_voice_reply,
+            args=(group_id, message),
+            daemon=True,
+        )
+        thread.start()
+        return
+
+    audio_ref = xingmang_voice.synthesize_reply(message) if wants_voice else ""
+    if audio_ref:
+        segments = [
+            {
+                "type": "record",
+                "data": {
+                    "file": xingmang_voice.onebot_record_file(audio_ref),
+                },
+            }
+        ]
+        if xingmang_voice.include_text():
+            segments.append({"type": "text", "data": {"text": "\n" + text_message}})
+        call_napcat(
+            "send_group_msg",
+            {
+                "group_id": int(group_id),
+                "message": segments,
+            },
+        )
+        return
+
     call_napcat(
         "send_group_msg",
         {
             "group_id": int(group_id),
-            "message": message,
+            "message": text_message,
         },
     )
+
+
+def send_group_voice_reply(group_id, message):
+    audio_ref = xingmang_voice.synthesize_reply(message)
+    if not audio_ref:
+        return
+    try:
+        call_napcat(
+            "send_group_msg",
+            {
+                "group_id": int(group_id),
+                "message": [
+                    {
+                        "type": "record",
+                        "data": {
+                            "file": xingmang_voice.onebot_record_file(audio_ref),
+                        },
+                    }
+                ],
+            },
+        )
+    except Exception:
+        logger.exception("Failed to send async voice reply group=%s", group_id)
 
 
 def load_anime_push_state():
@@ -305,6 +508,223 @@ def start_anime_daily_push_worker():
     thread.start()
 
 
+def load_proactive_state():
+    try:
+        data = json.loads(PROACTIVE_STATE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_proactive_state(state):
+    PROACTIVE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PROACTIVE_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def normalize_observed_text(event):
+    text = normalize_user_message(event)
+    text = re.sub(r"\[CQ:[^\]]+\]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:160]
+
+
+def observe_group_message(event):
+    if str(event.get("user_id") or "") == BOT_QQ:
+        return
+    text = normalize_observed_text(event)
+    if not text or len(text) < 2:
+        return
+    if message_mentions_bot(event):
+        return
+    group_id = int(event.get("group_id", 0))
+    item = {
+        "message_id": str(event.get("message_id") or event.get("message_seq") or ""),
+        "user_id": str(event.get("user_id") or ""),
+        "text": text,
+        "at": datetime.now(BEIJING_TZ).isoformat(),
+    }
+    with RECENT_GROUP_LOCK:
+        bucket = RECENT_GROUP_MESSAGES.setdefault(group_id, [])
+        if item["message_id"] and any(old.get("message_id") == item["message_id"] for old in bucket):
+            return
+        bucket.append(item)
+        del bucket[:-40]
+
+
+def in_proactive_quiet_hours(now=None):
+    now = now or datetime.now(BEIJING_TZ)
+    start = PROACTIVE_QUIET_START_HOUR
+    end = PROACTIVE_QUIET_END_HOUR
+    if start == end:
+        return False
+    if start < end:
+        return start <= now.hour < end
+    return now.hour >= start or now.hour < end
+
+
+def proactive_context_for_group(group_id):
+    with RECENT_GROUP_LOCK:
+        bucket = list(RECENT_GROUP_MESSAGES.get(group_id, []))
+    if len(bucket) < PROACTIVE_MIN_MESSAGES:
+        return [], ""
+    recent = bucket[-max(1, PROACTIVE_CONTEXT_MESSAGES):]
+    digest_src = "|".join(item.get("message_id") or item.get("text", "") for item in recent)
+    digest = hashlib.sha256(digest_src.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return recent, digest
+
+
+def build_local_proactive_reply(messages):
+    text = " ".join(item.get("text", "") for item in messages)[-500:]
+    expression = pick_expression()
+    if any(word in text for word in ("累", "困", "睡", "熬夜", "作业", "考试", "ddl", "DDL")):
+        choices = [
+            f"星芒探测到疲惫信号，先把电量慢慢充回来吧 {expression}",
+            f"深空频道建议：先喝水，再把任务拆小一点，别硬扛呀 {expression}",
+        ]
+    elif any(word in text for word in ("吃", "饭", "饿", "奶茶", "咖啡", "夜宵")):
+        choices = [
+            f"检测到食物话题，星芒的能量汽水也开始冒泡了 {expression}",
+            f"这条时间线适合补充能量，吃饱一点再继续跃迁 {expression}",
+        ]
+    elif any(word in text for word in ("笑", "哈哈", "草", "乐", "绷", "好玩")):
+        choices = [
+            f"这段聊天的欢乐指数有点亮，星芒全息眼在闪 {expression}",
+            f"群聊气氛已升温，触角网络收到快乐回声 {expression}",
+        ]
+    elif any(word in text for word in ("科幻", "星", "宇宙", "电影", "动漫", "小说", "游戏")):
+        choices = [
+            f"关键词触发星芒雷达：这话题有一点宇宙味道 {expression}",
+            f"星芒路过并轻轻点亮一颗小星星：继续讲，我在听 {expression}",
+        ]
+    else:
+        choices = [
+            f"星芒短暂冒泡一下，群聊信号稳定，继续继续 {expression}",
+            f"触角网络轻轻闪了一下，我路过听见啦 {expression}",
+            f"星芒在线围观中，给这段聊天加一点星光 {expression}",
+        ]
+    return random.choice(choices)
+
+
+def proactive_reply_worker():
+    if not PROACTIVE_REPLY_ENABLED:
+        logger.info("Proactive reply disabled")
+        return
+    while True:
+        time.sleep(max(60, PROACTIVE_CHECK_SECONDS))
+        if in_proactive_quiet_hours():
+            continue
+        state = load_proactive_state()
+        now_ts = time.time()
+        for group_id in sorted(TARGET_GROUP_IDS):
+            group_state = state.setdefault(str(group_id), {})
+            last_reply_at = float(group_state.get("last_reply_at") or 0)
+            if now_ts - last_reply_at < PROACTIVE_REPLY_COOLDOWN_SECONDS:
+                continue
+            if random.random() > PROACTIVE_REPLY_PROBABILITY:
+                continue
+            messages, digest = proactive_context_for_group(group_id)
+            if not messages or not digest:
+                continue
+            if digest == group_state.get("last_digest"):
+                continue
+            used = set(group_state.get("used_digests") or [])
+            if digest in used:
+                continue
+            reply = build_local_proactive_reply(messages)
+            try:
+                send_group_reply(group_id, reply)
+            except Exception:
+                logger.exception("Proactive reply failed group=%s", group_id)
+                continue
+            used.add(digest)
+            group_state.update({
+                "last_reply_at": now_ts,
+                "last_digest": digest,
+                "used_digests": list(sorted(used))[-80:],
+            })
+            save_proactive_state(state)
+
+
+def start_proactive_reply_worker():
+    thread = threading.Thread(target=proactive_reply_worker, name="proactive-reply-worker", daemon=True)
+    thread.start()
+
+
+def load_scheduled_content_state():
+    try:
+        return json.loads(SCHEDULED_CONTENT_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_scheduled_content_state(state):
+    SCHEDULED_CONTENT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SCHEDULED_CONTENT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+SCHEDULED_CONTENT_JOBS = (
+    ("today_nebula", 8, "今日星芒"),
+    ("star_map", 14, "今日星图"),
+    ("anime", 20, "动漫推荐"),
+)
+
+
+def next_scheduled_content_time(now=None):
+    now = now or datetime.now(BEIJING_TZ)
+    candidates = []
+    for key, hour, label in SCHEDULED_CONTENT_JOBS:
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        candidates.append((target, key, label))
+    return min(candidates, key=lambda item: item[0])
+
+
+def build_scheduled_content_message(job_key):
+    if job_key == "today_nebula":
+        return today_nebula(ensure_daily_state())
+    if job_key == "star_map":
+        return daily_visual(ensure_daily_state(), "star")
+    if job_key == "anime":
+        return build_anime_recommendation()
+    return ""
+
+
+def scheduled_content_worker():
+    while True:
+        target, job_key, label = next_scheduled_content_time()
+        logger.info("Next scheduled content %s at %s", label, target.isoformat())
+        while True:
+            sleep_seconds = (target - datetime.now(BEIJING_TZ)).total_seconds()
+            if sleep_seconds <= 0:
+                break
+            time.sleep(min(sleep_seconds, 3600))
+
+        today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+        state = load_scheduled_content_state()
+        sent_key = f"{job_key}:{today}"
+        if state.get(sent_key):
+            continue
+        message = build_scheduled_content_message(job_key)
+        if not message:
+            continue
+        sent_groups = []
+        for group_id in sorted(TARGET_GROUP_IDS):
+            try:
+                send_group_reply(group_id, message)
+                sent_groups.append(group_id)
+            except Exception:
+                logger.exception("Failed to push scheduled content=%s group=%s", job_key, group_id)
+        if sent_groups:
+            state[sent_key] = {"at": datetime.now(BEIJING_TZ).isoformat(), "groups": sent_groups}
+            save_scheduled_content_state(state)
+
+
+def start_scheduled_content_worker():
+    thread = threading.Thread(target=scheduled_content_worker, name="scheduled-content-worker", daemon=True)
+    thread.start()
+
+
 def story_chain_timeout_worker():
     """每 5 分钟检查一次：接龙局超过 2 小时无人操作就自动结算。"""
     while True:
@@ -338,6 +758,9 @@ def handle_event(event):
     event_group_id = int(event.get("group_id", 0))
     if event_group_id not in TARGET_GROUP_IDS:
         return
+
+    observe_group_message(event)
+
     if not message_mentions_bot(event):
         return
 
@@ -476,8 +899,10 @@ def main():
     logger.info("Listening groups: %s", sorted(TARGET_GROUP_IDS))
     logger.info("Webhook path: /onebot host=%s port=%s", HOST, PORT)
     logger.info("NapCat API: %s", NAPCAT_API_BASE)
-    start_anime_daily_push_worker()
+    start_scheduled_content_worker()
     start_time_chime_worker()
+    start_expression_refresh_worker()
+    start_proactive_reply_worker()
     start_story_chain_timeout_worker()
 
     try:

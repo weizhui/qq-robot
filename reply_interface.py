@@ -658,7 +658,7 @@ def call_deepseek(question, user_id=None, group_id=None):
     if not answer:
         return fallback_ai_answer()
     answer = clean_ai_answer(answer)
-    return f"🤖【星芒回答】\n{answer}\n\n✨ 来自 DeepSeek · 星芒整理完成 🛸"
+    return f"🤖【星芒回答】\n{answer}"
 
 
 def build_ai_answer(question, user_id=None, group_id=None):
@@ -678,25 +678,23 @@ def build_ai_answer(question, user_id=None, group_id=None):
 
 def bare_mention_text():
     activity = admin_content("活动") or DEFAULT_ACTIVITY_TEXT
-    return f"""✨【星芒·碰爪】✨
-来碰爪！我是星芒，霓虹螺旋角，全息电子眼 🛸💫
+    return f"""✨【星芒】✨
+我是星芒，霓虹螺旋角，全息电子眼 🛸💫
 欢迎随时呼叫我，触角一直开着～
 
 {activity}
 
-📡 指令都要加 / ，发 /帮助 看全部指令
-💭 直接 @我说句话（不带 /），就当我是在回答你的提问 ✨
-🧠 我会慢慢记住你的口味和说话习惯，发 /我的画像 查看、/忘记我 清空 ✨"""
+/帮助"""
 
 
 def help_text():
     return """✨【星芒·赛博帮助手册】✨
-来碰爪！我是星芒，霓虹螺旋角，全息电子眼 🛸💫
+我是星芒，霓虹螺旋角，全息电子眼 🛸💫
 
 📌 指令一律以 / 开头；直接 @我 说话（不带 /）＝ 向我提问 💭
 
 📡 基础指令
-/帮助　/签到　/碰爪　/今日星芒
+/帮助　/今日星芒
 
 🌌 星图与视觉
 /星图　/壁纸　/海报
@@ -716,25 +714,6 @@ def help_text():
 
 ⏳ 连续指令冷却 1 秒。
 🔋 每天最多回复 100 条指令，北京时间零点刷新。"""
-
-
-def checkin_text(cmd):
-    if "晚安" in cmd:
-        tail = "今晚适合把梦调到深空频道，晚安啦 🌙✨"
-    elif "早安" in cmd:
-        tail = "今日状态：适合幻想，不适合早八 ☀️📡"
-    else:
-        tail = random.choice([
-            "今日状态：适合幻想，不适合早八 ☀️",
-            "触角电量稳定，适合写下一个宇宙 📚",
-            "能量汽水已补充，赛博精神 +5 🥤",
-        ])
-    return f"""✅【星芒签到成功】
-星芒伸出触角，在你脑门上轻轻一点 🛸
-
-🥤 今日能量汽水 +1
-⚡ 赛博精神 +5
-🌟 {tail}"""
 
 
 def today_nebula(state):
@@ -1105,7 +1084,7 @@ DEFAULT_ASSOCIATION_INTRO = """🛸【星云科幻协会】
 这里聚集了一群爱科幻、爱幻想、爱星辰的人。
 读书会、观影夜、科幻创作、星图观测，都在星芒触角覆盖范围内。
 
-来碰爪，一起遨游科幻宇宙 ✨"""
+一起遨游科幻宇宙 ✨"""
 DEFAULT_ACTIVITY_TEXT = "📅【最近活动】\n最近活动占位信息，可由管理员更新。\n\n星芒的小日程本已经摊开啦 🛸✨"
 DEFAULT_RECRUIT_TEXT = """🌟【星云招新】
 星云科幻协会招新中！
@@ -1737,7 +1716,7 @@ def build_story_chain_result(group_id, user_id, story_text):
 
 # 用于记忆统计的指令标签，顺序即优先级
 COMMAND_LABELS = (
-    "帮助", "签到", "今日星芒", "碰爪", "星图", "壁纸", "海报",
+    "帮助", "今日星芒", "星图", "壁纸", "海报",
     "荐书", "荐影", "动漫", "冷知识", "运势", "抽签", "提问",
     "科幻接龙", "协会介绍", "活动", "招新", "投稿", "我的画像", "忘记我",
 )
@@ -1850,7 +1829,7 @@ def _build_reply(message, event, bot_qq, group_id):
             return story_reply
 
     if not cmd or not spoken:
-        # 单纯 @机器人（没写字，或只发了图片/表情）只回碰爪问候 + 最近活动 + /帮助 提示
+        # 单纯 @机器人（没写字，或只发了图片/表情）只回基础问候 + 最近活动 + /帮助 提示
         return bare_mention_text()
     if not is_command:
         # @机器人 直接说话但没带 / → 默认当成「/提问 问题」
@@ -1864,12 +1843,8 @@ def _build_reply(message, event, bot_qq, group_id):
         return build_ai_task(question, event)
     if any(word in cmd for word in ["帮助", "菜单", "功能"]):
         return help_text()
-    if any(word in cmd for word in ["签到", "早安", "晚安"]):
-        return checkin_text(cmd)
     if "今日星芒" in cmd:
         return today_nebula(state)
-    if "碰爪" in cmd:
-        return "🤝【碰爪成功】\n碰爪！星际协议达成。\n你已接入星芒触角网络，欢迎随时呼叫 🛸✨"
     if any(word in cmd for word in ["星图", "深空", "星云图"]):
         return daily_visual(state, "star")
     if "壁纸" in cmd or "科幻壁纸" in cmd:
